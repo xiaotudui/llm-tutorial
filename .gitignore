@@ -217,3 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .idea
+
+# Generated datasets and model checkpoints
+data/
+distilbert-rotten-tomatoes/

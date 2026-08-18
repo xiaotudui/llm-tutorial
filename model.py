@@ -36,11 +36,6 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.wo(output)
 
-class FeedForward(nn.Module):
-    def __init__(self):
-        
-        
-
 class TransformerBlock(nn.Module):
     def __init__(self, n_heads, n_kv_heads, dim):
         super().__init__()

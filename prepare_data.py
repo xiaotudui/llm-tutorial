@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 data_files = [
     "data/ultrafineweb_zh_l3/multi_style/"
     f"part-{i:05d}-c13afd3b-b5fb-4acd-97dc-e045a844c126-c000.snappy.parquet"
-    for i in range(50)
+    for i in range(1)
 ]
 
 ds = load_dataset(
@@ -15,3 +15,4 @@ ds = load_dataset(
 )
 
 tokenizer = AutoTokenizer.from_pretrained("zai-org/GLM-5.2")
+print(ds)
