@@ -1,3 +1,7 @@
+import os
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -10,9 +14,18 @@ data_files = [
 ds = load_dataset(
     "openbmb/Ultra-FineWeb-L3",
     "Ultra-FineWeb-L3-zh-Multi-Style-Synthetic",
-    data_files=data_files,
-    streaming=True
+    data_files=data_files
 )
 
 tokenizer = AutoTokenizer.from_pretrained("zai-org/GLM-5.2")
-print(ds)
+eos_id = tokenizer.eos_token_id
+if eos_id is None:
+    raise ValueError("Tokenizer 没有定义 eos_token_id")
+
+all_tokens = []
+for item in ds["train"]:
+    tokens = tokenizer.encode(item["content"], add_special_tokens=False)
+    if not tokens or tokens[-1] != eos_id:
+        tokens.append(eos_id)
+    all_tokens.extend(tokens)
+
