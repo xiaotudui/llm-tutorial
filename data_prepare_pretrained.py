@@ -13,10 +13,10 @@ from tqdm import tqdm
 
 def parse_args():
     parser = argparse.ArgumentParser(description="将文本语料编码为可供预训练使用的 token 文件")
-    parser.add_argument("--tokenizer", default="zai-org/GLM-5.2")
+    parser.add_argument("--tokenizer", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--output-dir", default="data/pretrained_data")
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--tokens-limit", type=int, default=4_000_000_000)
+    parser.add_argument("--tokens-limit", type=int, default=8_000_000_000)
     return parser.parse_args()
 
 

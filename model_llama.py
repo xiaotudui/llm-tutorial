@@ -1,5 +1,4 @@
 from transformers import LlamaConfig, LlamaForCausalLM
-from transformers import LlamaConfig
 
 # 8B Model 
 # config = LlamaConfig(
