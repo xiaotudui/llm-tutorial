@@ -220,4 +220,5 @@ __marimo__/
 
 # Generated datasets and model checkpoints
 data/
+outputs/
 distilbert-rotten-tomatoes/
