@@ -1,14 +1,12 @@
-"""将 Ultra-FineWeb-L3 中文 QA 转为阅读理解 SFT，微调 Qwen2.5-0.5B。"""
+"""使用 COIG-CQIA 中文指令数据进行 SFT，微调 Qwen2.5-0.5B。"""
 
 import argparse
-import hashlib
 import json
-import re
 from collections import Counter
 from pathlib import Path
 
 import torch
-from datasets import Dataset, DatasetDict, Features, Sequence, Value, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -20,48 +18,24 @@ from transformers import (
 )
 
 
-DATASET_NAME = "openbmb/Ultra-FineWeb-L3"
-DATASET_CONFIG = "Ultra-FineWeb-L3-zh-QA-Synthetic"
-SYSTEM_PROMPT = "你是一个中文助手，请根据用户提供的参考资料准确回答问题。"
-# 实际数据格式：原文 + 多个以行首“问题：”开始的问答，答案可能在同一行。
-QUESTION_PATTERN = re.compile(r"(?m)^[ \t]*问题[ \t]*[：:][ \t]*")
-ANSWER_PATTERN = re.compile(r"答案[ \t]*[：:][ \t]*")
+DATASET_NAME = "m-a-p/COIG-CQIA"
+SYSTEM_PROMPT = "你是一个中文助手，请准确、清晰地回答用户的问题。"
 CHAT_MARKERS = ("<|im_start|>", "<|im_end|>", "<|endoftext|>")
 
 
-def parse_qa_content(content: str) -> tuple[str, list[tuple[str, str]]]:
-    """只接受明确的问题/答案边界；不把未解析的整篇文章当作助手答案。"""
-    if not isinstance(content, str) or not content.strip():
-        return "", []
-    content = content.replace("\r\n", "\n").replace("\r", "\n")
-    questions = list(QUESTION_PATTERN.finditer(content))
-    if not questions:
-        return "", []
-    context = content[: questions[0].start()].strip()
-    pairs = []
-    seen = set()
-    for index, question in enumerate(questions):
-        end = questions[index + 1].start() if index + 1 < len(questions) else len(content)
-        block = content[question.end() : end]
-        # 多个“答案：”意味着边界不确定，跳过以免错误监督。
-        answers = list(ANSWER_PATTERN.finditer(block))
-        if len(answers) != 1:
-            continue
-        answer_marker = answers[0]
-        pair = (block[: answer_marker.start()].strip(), block[answer_marker.end() :].strip())
-        if all(pair) and pair not in seen:
-            pairs.append(pair)
-            seen.add(pair)
-    return context, pairs
-
-
-def encode_qa(tokenizer, context: str, question: str, answer: str, max_length: int):
-    """使用模型自带 chat template；仅答案和结束标记参与 next-token loss。"""
-    if any(marker in text for marker in CHAT_MARKERS for text in (context, question, answer)):
+def encode_qa(tokenizer, instruction: str, input_text: str, answer: str, max_length: int):
+    """instruction + 可空的 input 作为用户消息，仅监督 output 和结束标记。"""
+    if not all(isinstance(text, str) for text in (instruction, input_text, answer)):
+        return None, "invalid_fields"
+    instruction, input_text, answer = instruction.strip(), input_text.strip(), answer.strip()
+    if not instruction or not answer:
+        return None, "empty_fields"
+    if any(marker in text for marker in CHAT_MARKERS for text in (instruction, input_text, answer)):
         return None, "chat_marker"
+    user_content = instruction + ("\n\n" + input_text if input_text else "")
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"参考资料：\n{context}\n\n问题：{question}"},
+        {"role": "user", "content": user_content},
     ]
     prompt_ids = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True, return_dict=True,
@@ -75,7 +49,7 @@ def encode_qa(tokenizer, context: str, question: str, answer: str, max_length: i
     if input_ids[: len(prompt_ids)] != prompt_ids:
         raise ValueError("Chat template 的助手前缀不一致，无法可靠构建答案 loss mask")
     if len(input_ids) > max_length:
-        # 原文缺失会导致问题无法回答，截断答案会错误教会提前结束，因此整条跳过。
+        # 保留完整指令和答案，超长样本整条跳过，避免错误教会提前结束。
         return None, "too_long"
     if len(input_ids) <= len(prompt_ids):
         return None, "empty_answer"
@@ -88,73 +62,35 @@ def prepare_datasets(args, tokenizer) -> tuple[DatasetDict, dict]:
         source = load_dataset("json", data_files=args.data_file, split="train", streaming=True)
     else:
         source = load_dataset(
-            DATASET_NAME, DATASET_CONFIG, split="train", streaming=True,
+            DATASET_NAME, args.dataset_config, split="train", streaming=True,
             revision=args.dataset_revision,
         )
     source = source.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-    documents = []
-    seen_contexts = set()
+    samples = []
     stats = Counter()
-    for row in tqdm(source.take(args.max_documents), total=args.max_documents, desc="读取 QA 原文"):
-        stats["source_documents"] += 1
-        if "content" not in row:
-            raise ValueError("数据必须包含 content 字段，格式为原文 + 问题：…答案：…")
-        context, pairs = parse_qa_content(row["content"])
-        if not context or not pairs:
-            stats["unparseable_documents"] += 1
+    for row in tqdm(source.take(args.max_samples), total=args.max_samples, desc="编码指令样本"):
+        stats["source_samples"] += 1
+        if not {"instruction", "input", "output"} <= row.keys():
+            raise ValueError("数据必须包含 COIG-CQIA 格式的 instruction、input、output 字段")
+        sample, reason = encode_qa(
+            tokenizer, row["instruction"], row["input"], row["output"], args.max_length,
+        )
+        if sample is None:
+            stats[f"skipped_{reason}"] += 1
             continue
-        # 同一原文的所有 QA 必须留在同一个 split；精确去重忽略空白差异。
-        source_id = hashlib.sha256("".join(context.split()).encode("utf-8")).hexdigest()
-        if source_id in seen_contexts:
-            stats["duplicate_documents"] += 1
-            continue
-        seen_contexts.add(source_id)
-        documents.append({
-            "source_id": source_id,
-            "context": context,
-            "questions": [q for q, _ in pairs],
-            "answers": [a for _, a in pairs],
-        })
-        stats["parsed_pairs"] += len(pairs)
-    if not documents:
-        raise ValueError("未解析出有效的带原文 QA，请检查数据格式或增加 --max-documents")
-    raw = Dataset.from_list(documents)
+        samples.append(sample)
+    if not samples:
+        raise ValueError("无有效样本；请检查数据格式或增大 --max-length / --max-samples")
+    raw = Dataset.from_list(samples)
     if args.validation_ratio:
         if len(raw) < 2:
-            raise ValueError("按原文划分验证集至少需要两篇有效原文；短测可设 --validation-ratio 0")
+            raise ValueError("划分验证集至少需要两条有效样本；短测可设 --validation-ratio 0")
         split = raw.train_test_split(test_size=args.validation_ratio, seed=args.seed)
-        raw_splits = DatasetDict(train=split["train"], validation=split["test"])
+        encoded = DatasetDict(train=split["train"], validation=split["test"])
     else:
-        raw_splits = DatasetDict(train=raw)
-
-    features = Features({
-        "input_ids": Sequence(Value("int32")),
-        "attention_mask": Sequence(Value("int8")),
-        "labels": Sequence(Value("int32")),
-    })
-    encoded = DatasetDict()
-    for name, raw_split in raw_splits.items():
-        stats[f"{name}_documents"] = len(raw_split)
-
-        def encode_batch(batch):
-            output = {key: [] for key in features}
-            for context, questions, answers in zip(batch["context"], batch["questions"], batch["answers"]):
-                for question, answer in zip(questions, answers):
-                    sample, reason = encode_qa(tokenizer, context, question, answer, args.max_length)
-                    if sample is None:
-                        stats[f"{name}_skipped_{reason}"] += 1
-                        continue
-                    for key in output:
-                        output[key].append(sample[key])
-            return output
-
-        encoded[name] = raw_split.map(
-            encode_batch, batched=True, batch_size=16, remove_columns=raw_split.column_names,
-            features=features, load_from_cache_file=False, desc=f"编码 {name}（仅监督答案）",
-        )
-        stats[f"{name}_samples"] = len(encoded[name])
-        if not len(encoded[name]):
-            raise ValueError(f"{name} 无有效样本；请增大 --max-length / --max-documents 并检查原文格式")
+        encoded = DatasetDict(train=raw)
+    for name, dataset in encoded.items():
+        stats[f"{name}_samples"] = len(dataset)
     return encoded, dict(stats)
 
 
@@ -163,9 +99,11 @@ def parse_args():
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--model-revision", default="main")
     parser.add_argument("--dataset-revision", default="main")
-    parser.add_argument("--data-file", help="可选：本地 JSONL，包含与远程数据相同的 content 字段")
+    parser.add_argument("--dataset-config", default="zhihu", help="COIG-CQIA 子集，如 zhihu、ruozhiba、wiki")
+    parser.add_argument("--data-file", help="可选：本地 JSON/JSONL，包含 instruction、input、output 字段")
     parser.add_argument("--output-dir", default="outputs/qwen2.5-0.5b-sft")
-    parser.add_argument("--max-documents", type=int, default=10000, help="最多读取的原始文档数，一篇可拆出多组 QA")
+    parser.add_argument("--max-samples", "--max-documents", dest="max_samples", type=int, default=10000,
+                        help="最多读取的原始样本数（过滤前）")
     parser.add_argument("--shuffle-buffer", type=int, default=1000)
     parser.add_argument("--validation-ratio", type=float, default=0.02)
     parser.add_argument("--max-length", type=int, default=2048)
@@ -186,7 +124,7 @@ def parse_args():
     parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest", default=None)
     parser.add_argument("--prepare-only", action="store_true", help="保存编码后的数据和预览，不下载模型权重或训练")
     args = parser.parse_args()
-    for name in ("max_documents", "shuffle_buffer", "batch_size", "gradient_accumulation_steps"):
+    for name in ("max_samples", "shuffle_buffer", "batch_size", "gradient_accumulation_steps"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} 必须大于 0")
     if args.max_length < 32:
