@@ -68,7 +68,9 @@ def prepare_datasets(args, tokenizer) -> tuple[DatasetDict, dict]:
     source = source.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
     samples = []
     stats = Counter()
-    for row in tqdm(source.take(args.max_samples), total=args.max_samples, desc="编码指令样本"):
+    sample_limit = args.max_samples or None
+    rows = source.take(sample_limit) if sample_limit is not None else source
+    for row in tqdm(rows, total=sample_limit, desc="编码指令样本"):
         stats["source_samples"] += 1
         if not {"instruction", "input", "output"} <= row.keys():
             raise ValueError("数据必须包含 COIG-CQIA 格式的 instruction、input、output 字段")
@@ -102,11 +104,12 @@ def parse_args():
     parser.add_argument("--dataset-config", default="zhihu", help="COIG-CQIA 子集，如 zhihu、ruozhiba、wiki")
     parser.add_argument("--data-file", help="可选：本地 JSON/JSONL，包含 instruction、input、output 字段")
     parser.add_argument("--output-dir", default="outputs/qwen2.5-0.5b-sft")
-    parser.add_argument("--max-samples", "--max-documents", dest="max_samples", type=int, default=10000,
-                        help="最多读取的原始样本数（过滤前）")
+    parser.add_argument("--max-samples", "--max-documents", dest="max_samples", type=int, default=None,
+                        help="最多读取的原始样本数（过滤前）；默认或 0 表示读取所选子集/本地文件的全部样本")
     parser.add_argument("--shuffle-buffer", type=int, default=1000)
     parser.add_argument("--validation-ratio", type=float, default=0.02)
-    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--max-length", type=int, default=2048,
+                        help="完整对话的 token 上限（含系统提示、问题、答案和模板标记）；超长样本整条跳过")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--epochs", type=float, default=1.0)
@@ -124,7 +127,9 @@ def parse_args():
     parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest", default=None)
     parser.add_argument("--prepare-only", action="store_true", help="保存编码后的数据和预览，不下载模型权重或训练")
     args = parser.parse_args()
-    for name in ("max_samples", "shuffle_buffer", "batch_size", "gradient_accumulation_steps"):
+    if args.max_samples is not None and args.max_samples < 0:
+        parser.error("--max-samples 必须大于等于 0；0 表示不限样本数")
+    for name in ("shuffle_buffer", "batch_size", "gradient_accumulation_steps"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} 必须大于 0")
     if args.max_length < 32:
